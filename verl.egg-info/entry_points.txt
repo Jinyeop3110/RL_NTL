@@ -1,0 +1,4 @@
+[console_scripts]
+verl-eval = verl.trainer.main_eval:main
+verl-generate = verl.trainer.main_generation:main
+verl-train = verl.trainer.main_ppo:main

@@ -1,3 +1,68 @@
+Metadata-Version: 2.4
+Name: verl
+Version: 0.4.0.dev0
+Summary: Reinforcement Learning for Large Language Models
+Author: Bytedance Ltd.
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: torch
+Requires-Dist: transformers>=4.44.0
+Requires-Dist: tokenizers
+Requires-Dist: accelerate
+Requires-Dist: datasets
+Requires-Dist: numpy
+Requires-Dist: packaging
+Requires-Dist: pyyaml
+Requires-Dist: ray
+Requires-Dist: wandb
+Requires-Dist: omegaconf
+Requires-Dist: hydra-core
+Requires-Dist: sentencepiece
+Requires-Dist: protobuf
+Requires-Dist: pandas
+Requires-Dist: tqdm
+Requires-Dist: psutil
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: black; extra == "dev"
+Requires-Dist: isort; extra == "dev"
+Requires-Dist: flake8; extra == "dev"
+Provides-Extra: modelscope
+Requires-Dist: modelscope; extra == "modelscope"
+Provides-Extra: training
+Requires-Dist: deepspeed; extra == "training"
+Requires-Dist: megatron-core; extra == "training"
+Requires-Dist: flash-attn; extra == "training"
+Provides-Extra: inference
+Requires-Dist: vllm; extra == "inference"
+Requires-Dist: sglang; extra == "inference"
+Provides-Extra: full
+Requires-Dist: deepspeed; extra == "full"
+Requires-Dist: megatron-core; extra == "full"
+Requires-Dist: flash-attn; extra == "full"
+Requires-Dist: vllm; extra == "full"
+Requires-Dist: sglang; extra == "full"
+Dynamic: author
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
 # RL_NTL - VERL Reinforcement Learning for Large Language Models
 
 This repository contains the VERL (Versatile Efficient Reinforcement Learning) framework for training LLMs with PPO on mathematical reasoning tasks like GSM8K.
