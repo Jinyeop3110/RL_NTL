@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# VERL GSM8K PPO Training Script with Number Token Loss (NTL) Integration
-# Enhanced version that extracts digit-level log probabilities for NTL reward signals
+# VERL GSM8K PPO Training Script
+# Runs PPO training on prepared data and model
 # Prerequisites: Run ./prepare_gsm8k_data.sh first
 
 set -e
@@ -17,7 +17,7 @@ export PYTHONPATH=/home/yeopjin/orcd/pool/workspace/RL_NTL:$PYTHONPATH
 
 # Wandb configuration
 export WANDB_PROJECT='RL-NTL'
-export EXPERIMENT_NAME="gsm8k-ppo-qwen2.5-0.5b-ntl-$(date +%b%d)"
+export EXPERIMENT_NAME="gsm8k-ppo-qwen2.5-0.5b-default-$(date +%b%d)"
 
 # Configuration
 DATA_DIR="/home/yeopjin/orcd/pool/workspace/RL_NTL/data"
@@ -26,13 +26,12 @@ export BASE_MODEL="Qwen/Qwen2.5-0.5B-Instruct"
 # Clean triton cache
 rm -rf ~/.cache/torch/triton/
 
-echo "=== VERL GSM8K PPO Training with NTL ==="
+echo "=== VERL GSM8K PPO Training ==="
 echo "Experiment: ${EXPERIMENT_NAME}"
 echo "Model: ${BASE_MODEL}"
 echo "Dataset: GSM8K"
 echo "Data directory: ${DATA_DIR}"
 echo "Wandb project: ${WANDB_PROJECT}"
-echo "NTL Integration: ENABLED"
 echo ""
 
 # Verify prerequisites
@@ -41,12 +40,12 @@ if [ ! -f "$DATA_DIR/train.parquet" ] || [ ! -f "$DATA_DIR/test.parquet" ]; then
     exit 1
 fi
 
-echo "Prerequisites verified. Starting NTL-enhanced PPO training..."
+echo "Prerequisites verified. Starting PPO training..."
 LOG_FILE="${EXPERIMENT_NAME}.log"
 echo "Logging to: ${LOG_FILE}"
 echo ""
 
-PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
+PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_ntl \
     data.train_files=$DATA_DIR/train.parquet \
     data.val_files=$DATA_DIR/test.parquet \
     data.train_batch_size=256 \
@@ -69,10 +68,10 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.warmup_style=constant \
     actor_rollout_ref.actor.fsdp_config.param_offload=false \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=false \
-    actor_rollout_ref.actor.ntl_enabled=true \
-    actor_rollout_ref.actor.ntl_method=mse \
-    actor_rollout_ref.actor.ntl_weight=0.1 \
-    actor_rollout_ref.actor.extract_digit_info=true \
+    +actor_rollout_ref.actor.ntl_enabled=true \
+    +actor_rollout_ref.actor.ntl_method=mse \
+    +actor_rollout_ref.actor.ntl_weight=0.1 \
+    +actor_rollout_ref.actor.extract_digit_info=true \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
     actor_rollout_ref.ref.log_prob_micro_batch_size=16 \
     actor_rollout_ref.rollout.name=vllm \
@@ -98,7 +97,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     critic.model.fsdp_config.optimizer_offload=false \
     critic.strategy=fsdp \
     critic.ppo_mini_batch_size=64 \
-    critic.ppo_micro_batch_size_per_gpu=8 \
+    critic.ppo_micro_batch_size_per_gpu=4 \
     critic.ppo_epochs=1 \
     critic.cliprange_value=0.5 \
     critic.grad_clip=1.0 \
@@ -115,11 +114,8 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     reward_model.enable=false \
     reward_model.micro_batch_size=64 \
     reward_model.reward_manager=naive \
-    custom_reward_function.path=/home/yeopjin/orcd/pool/workspace/RL_NTL/custom_NTL.py \
+    custom_reward_function.path=/home/yeopjin/orcd/pool/workspace/RL_NTL/custom_default.py \
     custom_reward_function.name=compute_score \
-    custom_reward_function.use_ntl_bonus=true \
-    custom_reward_function.ntl_bonus_type=all \
-    custom_reward_function.ntl_bonus_weight=0.1 \
     trainer.project_name=$WANDB_PROJECT \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.n_gpus_per_node=4 \
@@ -129,16 +125,11 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.save_freq=-1 \
     trainer.logger="['console', 'wandb']" \
+    trainer.default_local_dir=/home/yeopjin/orcd/pool/workspace/RL_NTL/checkpoints/$EXPERIMENT_NAME \
     +trainer.mode=standard \
     2>&1 | tee $LOG_FILE
 
 echo ""
-echo "NTL-enhanced training complete!"
-echo "Checkpoints saved in: checkpoints/$WANDB_PROJECT/$EXPERIMENT_NAME"
+echo "Training complete!"
+echo "Checkpoints saved in: /home/yeopjin/orcd/pool/workspace/RL_NTL/checkpoints/$EXPERIMENT_NAME"
 echo "Log file: $LOG_FILE"
-echo ""
-echo "NTL Features enabled:"
-echo "- Digit-level log probability extraction"
-echo "- NTL-enhanced reward calculation"
-echo "- Digit accuracy metrics"
-echo "- NTL loss monitoring"

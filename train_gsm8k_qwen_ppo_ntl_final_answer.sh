@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# VERL GSM8K PPO Training Script with NTL Integration (Final Answer Focus)
-# This version focuses NTL analysis only on final answer digits, not all digits
+# VERL GSM8K PPO Training Script with NTL Integration
+# Uses exact_match × exp(-ntl_loss/tau) scoring to reward confident digit generation when correct
 # Prerequisites: Run ./prepare_gsm8k_data.sh first
 
 set -e
@@ -32,7 +32,7 @@ echo "Model: ${BASE_MODEL}"
 echo "Dataset: GSM8K"
 echo "Data directory: ${DATA_DIR}"
 echo "Wandb project: ${WANDB_PROJECT}"
-echo "NTL Integration: ENABLED (Final Answer Only)"
+echo "NTL Integration: ENABLED (exact_match × exp(-ntl_loss/tau))"
 echo ""
 
 # Verify prerequisites
@@ -46,7 +46,7 @@ LOG_FILE="${EXPERIMENT_NAME}.log"
 echo "Logging to: ${LOG_FILE}"
 echo ""
 
-PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
+PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo_ntl \
     data.train_files=$DATA_DIR/train.parquet \
     data.val_files=$DATA_DIR/test.parquet \
     data.train_batch_size=256 \
@@ -69,22 +69,23 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.warmup_style=constant \
     actor_rollout_ref.actor.fsdp_config.param_offload=false \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=false \
-    actor_rollout_ref.actor.ntl_enabled=true \
-    actor_rollout_ref.actor.ntl_method=mse \
-    actor_rollout_ref.actor.ntl_weight=0.1 \
-    actor_rollout_ref.actor.extract_digit_info=true \
+    +actor_rollout_ref.actor.use_ntl=true \
+    +actor_rollout_ref.actor.ntl_enabled=true \
+    +actor_rollout_ref.actor.ntl_method=wasserstein \
+    +actor_rollout_ref.actor.ntl_weight=0.1 \
+    +actor_rollout_ref.actor.extract_digit_info=true \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \
     actor_rollout_ref.ref.log_prob_micro_batch_size=16 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.dtype=bfloat16 \
-    actor_rollout_ref.rollout.temperature=1.0 \
+    actor_rollout_ref.rollout.temperature=5.0 \
     actor_rollout_ref.rollout.top_k=-1 \
     actor_rollout_ref.rollout.top_p=1 \
     actor_rollout_ref.rollout.do_sample=true \
     actor_rollout_ref.rollout.prompt_length=1024 \
     actor_rollout_ref.rollout.response_length=512 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.enforce_eager=true \
     actor_rollout_ref.rollout.free_cache_engine=true \
     actor_rollout_ref.rollout.ignore_eos=false \
@@ -98,7 +99,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     critic.model.fsdp_config.optimizer_offload=false \
     critic.strategy=fsdp \
     critic.ppo_mini_batch_size=64 \
-    critic.ppo_micro_batch_size_per_gpu=8 \
+    critic.ppo_micro_batch_size_per_gpu=4 \
     critic.ppo_epochs=1 \
     critic.cliprange_value=0.5 \
     critic.grad_clip=1.0 \
@@ -114,12 +115,10 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.kl_penalty=kl \
     reward_model.enable=false \
     reward_model.micro_batch_size=64 \
-    reward_model.reward_manager=naive \
-    custom_reward_function.path=/home/yeopjin/orcd/pool/workspace/RL_NTL/custom_NTL.py \
+    reward_model.reward_manager=ntl_naive \
+    custom_reward_function.path=/home/yeopjin/orcd/pool/workspace/RL_NTL/custom_ntl_final.py \
     custom_reward_function.name=compute_score \
-    custom_reward_function.use_ntl_bonus=true \
-    custom_reward_function.ntl_bonus_type=final_answer \
-    custom_reward_function.ntl_bonus_weight=0.15 \
+    +custom_reward_function.tau=2.0 \
     trainer.project_name=$WANDB_PROJECT \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.n_gpus_per_node=4 \
@@ -127,14 +126,15 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.total_epochs=15 \
     trainer.test_freq=10 \
     trainer.critic_warmup=0 \
-    trainer.save_freq=-1 \
+    trainer.save_freq=100 \
     trainer.logger="['console', 'wandb']" \
+    trainer.default_local_dir=/home/yeopjin/orcd/pool/workspace/RL_NTL/checkpoints/$EXPERIMENT_NAME \
     +trainer.mode=standard \
     2>&1 | tee $LOG_FILE
 
 echo ""
 echo "NTL-enhanced training (final answer focus) complete!"
-echo "Checkpoints saved in: checkpoints/$WANDB_PROJECT/$EXPERIMENT_NAME"
+echo "Checkpoints saved in: /home/yeopjin/orcd/pool/workspace/RL_NTL/checkpoints/$EXPERIMENT_NAME"
 echo "Log file: $LOG_FILE"
 echo ""
 echo "NTL Features enabled:"

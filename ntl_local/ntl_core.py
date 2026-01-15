@@ -24,14 +24,16 @@ class NTLDigitExtractor:
         # Create reverse mapping: digit_value -> token_id
         self.digit_to_token = {v: k for k, v in self.digit_token_map.items()}
         
-        print(f"[NTL] Found {len(self.digit_token_map)} digit tokens: {self.digit_token_map}")
     
     def extract_digit_log_probs(self, 
                                logits: torch.Tensor, 
                                input_ids: torch.Tensor,
                                attention_mask: Optional[torch.Tensor] = None) -> Dict:
         """
-        Extract digit-level log probabilities from model logits.
+        Extract digit-level log probabilities from model logits - OPTIMIZED VERSION.
+        
+        Instead of computing softmax over all 151K tokens, this extracts only the 10 digit tokens.
+        This reduces computation from O(vocab_size) to O(10) per position.
         
         Args:
             logits: Model logits [batch_size, seq_len, vocab_size]
@@ -52,14 +54,27 @@ class NTLDigitExtractor:
                                    fill_value=-float('inf'), 
                                    device=device, dtype=logits.dtype)
         
-        # Compute log probabilities for all tokens
-        log_probs = F.log_softmax(logits, dim=-1)
+        # OPTIMIZATION: Extract logits for only the 10 digit tokens instead of computing full vocab softmax
+        digit_token_ids = []
+        digit_value_map = {}  # Maps index in extracted tensor to digit value
         
-        # Extract log probabilities for digit tokens (0-9)
         for digit_value in range(10):
             if digit_value in self.digit_to_token:
-                token_id = self.digit_to_token[digit_value]
-                digit_log_probs[:, :, digit_value] = log_probs[:, :, token_id]
+                token_id = self.digit_to_token[digit_value] 
+                digit_token_ids.append(token_id)
+                digit_value_map[len(digit_token_ids) - 1] = digit_value
+        
+        if digit_token_ids:
+            # Extract logits for only digit tokens [batch_size, seq_len, num_digit_tokens]
+            digit_token_ids_tensor = torch.tensor(digit_token_ids, device=device)
+            digit_logits = torch.index_select(logits, dim=-1, index=digit_token_ids_tensor)
+            
+            # Compute log softmax over only the digit tokens - MUCH faster than full vocab (151K -> ~10)
+            digit_log_probs_extracted = F.log_softmax(digit_logits, dim=-1)
+            
+            # Map the extracted probabilities to correct digit positions
+            for extracted_idx, digit_value in digit_value_map.items():
+                digit_log_probs[:, :, digit_value] = digit_log_probs_extracted[:, :, extracted_idx]
         
         # Find positions and ground truth for digit tokens
         digit_positions = []
@@ -92,7 +107,11 @@ def extract_digit_log_probabilities(logits: torch.Tensor,
                                   tokenizer,
                                   attention_mask: Optional[torch.Tensor] = None) -> Dict:
     """
-    Convenience function to extract digit log probabilities.
+    Extract digit log probabilities for reward function usage.
+    
+    This function extracts the full digit log probabilities tensor that will be 
+    passed to the reward function. The reward function can then compute its own
+    NTL-based metrics using this data.
     
     Args:
         logits: Model logits [batch_size, seq_len, vocab_size]
@@ -101,7 +120,11 @@ def extract_digit_log_probabilities(logits: torch.Tensor,
         attention_mask: Optional attention mask
         
     Returns:
-        Dict with digit log probabilities and metadata
+        Dict with:
+        - 'digit_log_probs': [batch_size, seq_len, 10] tensor of digit log probabilities 
+        - 'digit_positions': List[List[int]] positions where digits occur
+        - 'digit_ground_truth': List[List[int]] ground truth digit values
+        - Additional metadata for reward function
     """
     extractor = NTLDigitExtractor(tokenizer)
     return extractor.extract_digit_log_probs(logits, input_ids, attention_mask)
@@ -227,6 +250,76 @@ def compute_ntl_loss_wasserstein(digit_log_probs: torch.Tensor,
         return losses.sum()
     else:
         return losses
+
+
+def prepare_digit_logprobs_for_reward(logits: torch.Tensor,
+                                    input_ids: torch.Tensor,
+                                    tokenizer,
+                                    attention_mask: Optional[torch.Tensor] = None) -> Dict:
+    """
+    Prepare digit log probabilities tensor for reward function.
+    
+    This is the main function that should be called to extract NTL information
+    for passing to the reward function. It returns the full digit log probabilities
+    tensor that the reward function can use for its computations.
+    
+    IMPORTANT: Always returns tensors for ALL samples in the batch, even if some samples
+    don't contain digits (they get zero matrices).
+    
+    Args:
+        logits: Model logits [batch_size, seq_len, vocab_size]
+        input_ids: Input token IDs [batch_size, seq_len]
+        tokenizer: HuggingFace tokenizer
+        attention_mask: Optional attention mask
+        
+    Returns:
+        Dict containing:
+        - 'digit_log_probs': Tensor [batch_size, seq_len, 10] - THE KEY DATA FOR REWARD FUNCTION
+        - 'digit_ground_truth_tensor': Tensor [batch_size, seq_len, 10] - One-hot encoded ground truth
+        - Additional metadata
+    """
+    # Extract the base digit information
+    digit_info = extract_digit_log_probabilities(logits, input_ids, tokenizer, attention_mask)
+    
+    # Always create tensors for ALL samples in the batch
+    batch_size, seq_len = input_ids.shape
+    device = logits.device
+    
+    # CRITICAL: Always return [batch_size, seq_len, 10] tensors, even if some samples have no digits
+    # Create digit_log_probs tensor for ALL samples (default to zeros)
+    digit_log_probs_full = torch.zeros(batch_size, seq_len, 10, device=device, dtype=torch.float32)
+    
+    # Create one-hot encoded ground truth tensor for ALL samples (default to zeros)
+    digit_ground_truth_tensor = torch.zeros(batch_size, seq_len, 10, device=device, dtype=torch.float32)
+    
+    # Fill in actual data for samples that have digit information
+    # digit_info['digit_log_probs'] might be smaller than [batch_size, seq_len, 10] if some samples have no digits
+    if 'digit_log_probs' in digit_info and digit_info['digit_log_probs'] is not None:
+        actual_digit_probs = digit_info['digit_log_probs']
+        # Copy the actual data, but only for the samples that have it
+        if actual_digit_probs.shape[0] <= batch_size:
+            digit_log_probs_full[:actual_digit_probs.shape[0]] = actual_digit_probs
+    
+    # Fill in the ground truth values for samples that have digits
+    for batch_idx in range(batch_size):
+        if batch_idx < len(digit_info['digit_positions']):  # Safety check
+            positions = digit_info['digit_positions'][batch_idx]
+            ground_truth = digit_info['digit_ground_truth'][batch_idx]
+            
+            for i, pos in enumerate(positions):
+                if i < len(ground_truth) and pos < seq_len:  # Safety check
+                    digit_value = ground_truth[i]
+                    if 0 <= digit_value <= 9:  # Ensure valid digit
+                        digit_ground_truth_tensor[batch_idx, pos, digit_value] = 1.0
+    
+    # The key output is the digit_log_probs tensor [batch_size, seq_len, 10]
+    # This contains log probabilities for digits 0-9 at every position
+    # ALWAYS returns data for ALL samples - samples without digits get zero matrices
+    return {
+        'digit_log_probs': digit_log_probs_full,  # [batch_size, seq_len, 10] - ALWAYS full batch size
+        'digit_ground_truth_tensor': digit_ground_truth_tensor,  # [batch_size, seq_len, 10] - ALWAYS full batch size
+        # Removed metadata: digit_token_map, has_digit_info, method (unnecessary for protocol)
+    }
 
 
 def compute_ntl_reward_signal(digit_log_probs: torch.Tensor,

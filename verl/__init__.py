@@ -15,10 +15,29 @@
 import importlib
 import logging
 import os
-from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as get_version
 
-from packaging.version import parse as parse_version
+# Handle Python 3.6 compatibility
+try:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as get_version
+except ImportError:
+    # Fallback for Python < 3.8
+    try:
+        from importlib_metadata import PackageNotFoundError
+        from importlib_metadata import version as get_version
+    except ImportError:
+        # Final fallback - define dummy classes
+        class PackageNotFoundError(Exception):
+            pass
+        def get_version(package):
+            return "unknown"
+
+try:
+    from packaging.version import parse as parse_version
+except ImportError:
+    # Fallback for missing packaging module
+    def parse_version(version):
+        return version
 
 from .protocol import DataProto
 from .utils.device import is_npu_available

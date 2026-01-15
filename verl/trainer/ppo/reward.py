@@ -128,6 +128,16 @@ def load_reward_manager(config, tokenizer, num_examine, **reward_kwargs):
         else:
             final_compute_score = default_compute_score
 
+    # Extract tau and ntl_method from custom_reward_function config if available
+    custom_reward_config = config.get("custom_reward_function", {})
+    if "tau" in custom_reward_config:
+        reward_kwargs["tau"] = custom_reward_config["tau"]
+    
+    # Also check actor_rollout_ref.actor for ntl_method
+    actor_config = config.get("actor_rollout_ref", {}).get("actor", {})
+    if "ntl_method" in actor_config:
+        reward_kwargs["ntl_method"] = actor_config["ntl_method"]
+    
     # Instantiate and return the reward manager with the specified parameters
     return reward_manager_cls(
         tokenizer=tokenizer,

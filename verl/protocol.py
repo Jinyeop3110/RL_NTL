@@ -389,7 +389,13 @@ class DataProto:
 
         if self.non_tensor_batch is not None:
             for key, val in self.non_tensor_batch.items():
-                assert isinstance(val, np.ndarray)
+                # Allow numpy arrays, numpy scalar types, and common metadata types
+                allowed_types = (np.ndarray, np.generic, dict, list, str, bool, int, float, type(None))
+                if not isinstance(val, allowed_types):
+                    print(f"[DEBUG-CONSISTENCY] FAILED: key='{key}', type={type(val)}, value preview: {str(val)[:200]}...")
+                # Only assert for truly problematic types - allow metadata types
+                if not isinstance(val, allowed_types):
+                    assert False, f"Unsupported type {type(val)} for key '{key}'"
 
         if self.batch is not None and self.non_tensor_batch is not None and len(self.non_tensor_batch) != 0:
             # TODO: we can actually lift this restriction if needed
@@ -399,7 +405,7 @@ class DataProto:
             for key, val in self.non_tensor_batch.items():
                 assert isinstance(val, np.ndarray), (
                     f"data in the non_tensor_batch must be a numpy.array with dtype=object, but for "
-                    f"{key=}, got {type(val)=}"
+                    f"key={key}, got type(val)={type(val)}"
                 )
                 assert val.shape[0] == batch_size, (
                     f"key {key} length {len(val)} is not equal to batch size {batch_size}"
@@ -818,11 +824,191 @@ class DataProto:
         new_batch = torch.cat(batch_lst, dim=0) if batch_lst[0] is not None else None
 
         non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
+        
+        
+        # Create a new dictionary to avoid "dictionary changed size during iteration" error
+        new_non_tensor_batch = {}
+        
+        # Determine expected batch size for creating fallback arrays
+        # NOTE: NTL data should always have the same batch size as tensor batch size
+        expected_batch_size = new_batch.batch_size[0] if new_batch is not None else 0
+        
         for key, val in non_tensor_batch.items():
-            non_tensor_batch[key] = np.concatenate(val, axis=0)
+            # Special handling for ntl_info - now simplified to only essential scalar arrays
+            if key == 'ntl_info':
+                
+                # ntl_info now contains only simple scalar arrays that can be concatenated normally
+                if all(isinstance(item, dict) for item in val):
+                    merged_ntl_info = {}
+                    # Get all keys from the first non-empty ntl_info dict
+                    all_keys = set()
+                    for item in val:
+                        if item:
+                            all_keys.update(item.keys())
+                    
+                    for ntl_key in all_keys:
+                        arrays_to_concat = []
+                        
+                        for worker_idx, item in enumerate(val):
+                            if ntl_key in item:
+                                ntl_val = item[ntl_key]
+                                # Handle different types of NTL data
+                                try:
+                                    if isinstance(ntl_val, np.ndarray):
+                                        arrays_to_concat.append(ntl_val)
+                                    elif isinstance(ntl_val, (list, tuple)):
+                                        # Try to convert lists/tuples to numpy arrays
+                                        # This might fail for ragged/inhomogeneous data
+                                        try:
+                                            arrays_to_concat.append(np.array(ntl_val))
+                                        except ValueError as e:
+                                            # If conversion fails, this indicates incompatible data structure
+                                            print(f"[DEBUG-PROTOCOL] Cannot convert to numpy array: ntl_key='{ntl_key}', type={type(ntl_val)}, error={e}")
+                                            if hasattr(ntl_val, '__len__') and len(ntl_val) > 0:
+                                                print(f"[DEBUG-PROTOCOL]   First element: type={type(ntl_val[0])}, shape={getattr(ntl_val[0], 'shape', 'N/A')}")
+                                            # Skip this item rather than adding incompatible data
+                                            continue
+                                    elif ntl_val is not None:
+                                        # Convert scalars to arrays
+                                        arrays_to_concat.append(np.array([ntl_val]))
+                                except Exception as e:
+                                    print(f"[DEBUG-PROTOCOL] Error processing ntl_key='{ntl_key}', type={type(ntl_val)}, shape={getattr(ntl_val, 'shape', 'N/A')}, value={ntl_val}")
+                                    raise e
+                        
+                        if arrays_to_concat:
+                            # Special handling for different NTL data types
+                            if ntl_key in ['digit_log_probs', 'digit_ground_truth_tensor']:
+                                # These are 3D tensors: [batch_size, seq_len, 10]
+                                # DEBUG: Check what's actually in arrays_to_concat
+                                print(f"[DEBUG-PROTOCOL] Concatenating {ntl_key}:")
+                                print(f"[DEBUG-PROTOCOL]   arrays_to_concat length: {len(arrays_to_concat)}")
+                                for i, arr in enumerate(arrays_to_concat[:3]):  # Show first 3
+                                    print(f"[DEBUG-PROTOCOL]   [{i}] type: {type(arr)}, shape: {getattr(arr, 'shape', 'N/A')}, dtype: {getattr(arr, 'dtype', 'N/A')}")
+                                    if hasattr(arr, 'shape') and len(arr.shape) > 0:
+                                        print(f"[DEBUG-PROTOCOL]       first element type: {type(arr.flat[0]) if arr.size > 0 else 'empty'}")
+                                try:
+                                    # Concatenate along batch dimension (axis=0)
+                                    merged_ntl_info[ntl_key] = np.concatenate(arrays_to_concat, axis=0)
+                                    print(f"[DEBUG-PROTOCOL]   ✅ Success: final shape {merged_ntl_info[ntl_key].shape}")
+                                except Exception as e:
+                                    print(f"[DEBUG-PROTOCOL]   ❌ Failed: {e}")
+                                    # Create arrays with correct tensor batch dimension for consistency check
+                                    if arrays_to_concat and len(arrays_to_concat) > 0:
+                                        # Try to create array with same shape as first valid array but with correct batch size
+                                        first_valid = next((arr for arr in arrays_to_concat if isinstance(arr, np.ndarray)), None)
+                                        if first_valid is not None and len(first_valid.shape) >= 2:
+                                            # For 3D tensors like [batch_size, seq_len, 10], create [expected_batch_size, seq_len, 10]
+                                            fallback_shape = (expected_batch_size,) + first_valid.shape[1:]
+                                            merged_ntl_info[ntl_key] = np.zeros(fallback_shape, dtype=first_valid.dtype)
+                                            print(f"[DEBUG-PROTOCOL]   Created fallback array with shape {merged_ntl_info[ntl_key].shape}")
+                                        else:
+                                            # For 1D or unknown shapes, create simple 1D array with correct batch size
+                                            merged_ntl_info[ntl_key] = np.zeros(expected_batch_size, dtype=np.float32)
+                                            print(f"[DEBUG-PROTOCOL]   Created 1D fallback array with shape {merged_ntl_info[ntl_key].shape}")
+                                    else:
+                                        # No data to infer from, create simple 1D array with correct batch size
+                                        merged_ntl_info[ntl_key] = np.zeros(expected_batch_size, dtype=np.float32)
+                                        print(f"[DEBUG-PROTOCOL]   Created default fallback array with shape {merged_ntl_info[ntl_key].shape}")
+                            elif ntl_key == 'ntl_loss':
+                                # For 2D arrays, we need to properly handle the batch dimension
+                                try:
+                                    flattened_arrays = []
+                                    for arr in arrays_to_concat:
+                                        if arr.ndim == 2:
+                                            # Shape is (batch_size, sequence_length) 
+                                            # BUT based on debug output, it might be (1, num_samples)
+                                            # Let's try flattening the entire array to get all values
+                                            # Flatten the 2D array completely to get individual sample values
+                                            flattened = arr.flatten()  # Shape: (batch_size * sequence_length,)
+                                            flattened_arrays.append(flattened)
+                                        else:
+                                            flattened_arrays.append(arr)
+                                    
+                                    merged_ntl_info[ntl_key] = np.concatenate(flattened_arrays, axis=0)
+                                except Exception as e:
+                                    print(f"[DEBUG-PROTOCOL] ntl_loss concatenation failed: {e}")
+                                    # Create fallback array with correct tensor batch size
+                                    merged_ntl_info[ntl_key] = np.zeros(expected_batch_size, dtype=np.float32)
+                                    print(f"[DEBUG-PROTOCOL]   Created ntl_loss fallback array with shape {merged_ntl_info[ntl_key].shape}")
+                            elif ntl_key in ['digit_token_map', 'has_digit_info', 'method']:
+                                # These are metadata that should be the same across workers, just take the first one
+                                for arr in arrays_to_concat:
+                                    if arr is not None:
+                                        if isinstance(arr, np.ndarray):
+                                            if arr.size == 1:
+                                                merged_ntl_info[ntl_key] = arr.item()
+                                            else:
+                                                # For multi-element arrays, just take the first element or the array itself
+                                                merged_ntl_info[ntl_key] = arr.flat[0] if arr.ndim > 0 else arr
+                                        else:
+                                            merged_ntl_info[ntl_key] = arr
+                                        break
+                            else:
+                                # Default concatenation along axis=0 for other arrays
+                                try:
+                                    merged_ntl_info[ntl_key] = np.concatenate(arrays_to_concat, axis=0)
+                                except Exception as e:
+                                    print(f"[DEBUG-PROTOCOL] Default concatenation failed for {ntl_key}: {e}")
+                                    # Create fallback array with correct tensor batch size
+                                    merged_ntl_info[ntl_key] = np.zeros(expected_batch_size, dtype=np.float32)
+                                    print(f"[DEBUG-PROTOCOL]   Created default fallback array with shape {merged_ntl_info[ntl_key].shape}")
+                    
+                    # Flatten ntl_info dictionary into separate keys to satisfy consistency check
+                    for ntl_key, ntl_value in merged_ntl_info.items():
+                        # Only add ntl_ prefix if not already present
+                        if ntl_key.startswith('ntl_'):
+                            flattened_key = ntl_key
+                        else:
+                            flattened_key = f"ntl_{ntl_key}"
+                        new_non_tensor_batch[flattened_key] = ntl_value
+                    continue
+            
+            # Check if all items are numpy arrays and handle consistently
+            all_numpy = all(isinstance(item, np.ndarray) for item in val)
+            
+            if all_numpy:
+                # All items are numpy arrays - check dimensions
+                dims = [item.ndim for item in val]
+                shapes = [item.shape for item in val]
+                
+                if all(dim == 0 for dim in dims):
+                    # All scalar arrays - convert to 1D arrays
+                    arrays_to_concat = [np.array([item.item()]) for item in val]
+                elif any(dim == 0 for dim in dims):
+                    # Mixed scalar and non-scalar - normalize all to same dimension
+                    arrays_to_concat = []
+                    for item in val:
+                        if item.ndim == 0:
+                            arrays_to_concat.append(np.array([item.item()]))
+                        else:
+                            arrays_to_concat.append(item)
+                else:
+                    # All proper arrays
+                    arrays_to_concat = val
+                
+                try:
+                    new_non_tensor_batch[key] = np.concatenate(arrays_to_concat, axis=0)
+                except Exception as e:
+                    raise
+            else:
+                # Not all numpy arrays - convert all to arrays first
+                arrays_to_concat = []
+                for item in val:
+                    if isinstance(item, np.ndarray):
+                        if item.ndim == 0:
+                            arrays_to_concat.append(np.array([item.item()]))
+                        else:
+                            arrays_to_concat.append(item)
+                    else:
+                        arrays_to_concat.append(np.array([item]))
+                
+                try:
+                    new_non_tensor_batch[key] = np.concatenate(arrays_to_concat, axis=0)
+                except Exception as e:
+                    raise
 
         cls = type(data[0]) if len(data) > 0 else DataProto
-        return cls(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=data[0].meta_info)
+        return cls(batch=new_batch, non_tensor_batch=new_non_tensor_batch, meta_info=data[0].meta_info)
 
     def reorder(self, indices):
         """

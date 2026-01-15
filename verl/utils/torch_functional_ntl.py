@@ -19,7 +19,10 @@ from .torch_functional import (
 )
 
 # Import our NTL implementation
-from ...ntl_local import extract_digit_log_probabilities, compute_ntl_reward_signal
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+from ntl_local import extract_digit_log_probabilities, prepare_digit_logprobs_for_reward, compute_ntl_reward_signal
 
 
 def logprobs_from_logits_with_ntl(logits, labels, tokenizer=None, extract_ntl=False, inplace_backward=True):
@@ -93,7 +96,7 @@ def compute_ntl_augmented_loss(logits: torch.Tensor,
     )
     
     # Compute NTL loss
-    from ...ntl_local.ntl_core import compute_ntl_loss_mse, compute_ntl_loss_wasserstein
+    from ntl_local.ntl_core import compute_ntl_loss_mse, compute_ntl_loss_wasserstein
     
     if ntl_method == 'mse':
         ntl_loss = compute_ntl_loss_mse(
@@ -183,9 +186,11 @@ def prepare_ntl_reward_data(logits: torch.Tensor,
                           tokenizer,
                           sequence_strings: Optional[list] = None) -> Dict[str, Any]:
     """
-    Prepare all NTL-related data needed for reward calculation.
-    This function extracts and organizes all digit-level information
-    that can be passed to custom reward functions.
+    Prepare digit log probabilities tensor for reward function.
+    
+    This function now focuses on extracting the full digit log probabilities
+    tensor [batch_size, seq_len, 10] that will be passed to the reward function.
+    The reward function can then compute its own NTL-based metrics.
     
     Args:
         logits: Model logits [batch_size, seq_len, vocab_size]
@@ -194,39 +199,16 @@ def prepare_ntl_reward_data(logits: torch.Tensor,
         sequence_strings: Optional list of decoded sequence strings
         
     Returns:
-        Dict with comprehensive NTL information for reward calculation
+        Dict with digit log probabilities tensor for reward calculation:
+        - 'digit_log_probs': [batch_size, seq_len, 10] - KEY DATA FOR REWARD FUNCTION
+        - Additional metadata
     """
-    # Extract base digit information
-    digit_info = extract_digit_logits_and_positions(logits, input_ids, tokenizer)
+    # Use the new dedicated function for reward preparation
+    reward_data = prepare_digit_logprobs_for_reward(logits, input_ids, tokenizer)
     
-    # Compute NTL reward signals
-    ntl_reward_info = compute_ntl_reward_signal(
-        digit_info['digit_log_probs'],
-        digit_info['digit_ground_truth'],
-        digit_info['digit_positions'],
-        method='mse'
-    )
-    
-    # Organize all information for reward function
-    reward_data = {
-        # Basic NTL info
-        'digit_log_probs': digit_info['digit_log_probs'],
-        'digit_positions': digit_info['digit_positions'],
-        'digit_ground_truth': digit_info['digit_ground_truth'],
-        'digit_token_map': digit_info['digit_token_map'],
-        
-        # NTL metrics
-        'ntl_loss': ntl_reward_info['ntl_loss'],
-        'ntl_reward': ntl_reward_info['ntl_reward'],
-        'digit_accuracy': ntl_reward_info['digit_accuracy'],
-        'total_digits': ntl_reward_info['total_digits'],
-        'correct_digits': ntl_reward_info['correct_digits'],
-        
-        # Additional context
-        'has_digits': digit_info['has_digits'],
-        'sequence_strings': sequence_strings,
-        'batch_size': logits.shape[0],
-        'seq_len': logits.shape[1]
-    }
+    # Add any additional context
+    reward_data['sequence_strings'] = sequence_strings
+    reward_data['batch_size'] = logits.shape[0]
+    reward_data['seq_len'] = logits.shape[1]
     
     return reward_data

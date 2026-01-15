@@ -218,6 +218,13 @@ class FSDPActorConfig(ActorConfig):
     entropy_checkpointing: bool = False
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     use_remove_padding: bool = False
+    
+    # NTL (Number Token Loss) parameters
+    use_ntl: bool = False  # Main flag to enable NTL actor
+    ntl_enabled: bool = False
+    ntl_method: str = "mse"
+    ntl_weight: float = 0.1
+    extract_digit_info: bool = False
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""

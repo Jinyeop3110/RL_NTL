@@ -672,7 +672,7 @@ class RayPPOTrainer:
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
+                "recompute_log_prob": True,  # Enable log prob computation for NTL during validation
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
                 "global_steps": self.global_steps,

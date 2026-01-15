@@ -11,7 +11,6 @@ from .dp_actor import DataParallelPPOActor
 
 # Import NTL utilities
 from ...utils.torch_functional_ntl import (
-    prepare_ntl_reward_data,
     extract_digit_logits_and_positions,
     logprobs_from_logits_with_ntl
 )
@@ -31,6 +30,9 @@ class DataParallelPPOActorNTL(DataParallelPPOActor):
     """
     
     def __init__(self, *args, **kwargs):
+        # Extract tokenizer if passed
+        self.tokenizer = kwargs.pop('tokenizer', None)
+        
         super().__init__(*args, **kwargs)
         
         # NTL configuration
@@ -39,8 +41,6 @@ class DataParallelPPOActorNTL(DataParallelPPOActor):
         self.ntl_weight = getattr(self.config, 'ntl_weight', 0.1)
         self.extract_digit_info = getattr(self.config, 'extract_digit_info', True)
         
-        print(f"[NTL Actor] Initialized with ntl_enabled={self.ntl_enabled}, "
-              f"method={self.ntl_method}, weight={self.ntl_weight}")
     
     def _forward_micro_batch_with_ntl(self, 
                                     micro_batch: Dict[str, torch.Tensor],
@@ -87,9 +87,10 @@ class DataParallelPPOActorNTL(DataParallelPPOActor):
                 response_logits = logits[:, -response_length - 1 : -1, :]
                 response_ids = micro_batch["responses"]
                 
-                # Extract NTL information
+                # Extract NTL information - now returns full digit logprobs tensor
                 try:
-                    ntl_reward_data = prepare_ntl_reward_data(
+                    from ntl_local import prepare_digit_logprobs_for_reward
+                    ntl_reward_data = prepare_digit_logprobs_for_reward(
                         logits=response_logits,
                         input_ids=response_ids,
                         tokenizer=self.tokenizer  # Assuming tokenizer is available
@@ -97,7 +98,6 @@ class DataParallelPPOActorNTL(DataParallelPPOActor):
                     ntl_info = ntl_reward_data
                     
                 except Exception as e:
-                    print(f"[NTL Actor] Warning: Failed to extract NTL info: {e}")
                     ntl_info = {'error': str(e)}
         
         return entropy, log_probs, ntl_info
@@ -146,53 +146,40 @@ class DataParallelPPOActorNTL(DataParallelPPOActor):
         return log_probs, combined_ntl_info
     
     def _combine_ntl_info(self, ntl_info_list: list) -> Dict:
-        """Combine NTL information from multiple micro-batches."""
+        """
+        Combine NTL information from multiple micro-batches.
+        
+        The key output is 'digit_log_probs' tensor [batch_size, seq_len, 10]
+        that will be passed to the reward function.
+        """
         if not ntl_info_list or not any(ntl_info_list):
             return {}
         
         combined = {}
         
-        # Lists that need to be concatenated
-        list_keys = ['digit_positions', 'digit_ground_truth', 'has_digits', 'sequence_strings']
-        # Tensors that need to be concatenated
-        tensor_keys = ['digit_log_probs']
-        # Scalars that need to be summed
-        sum_keys = ['total_digits', 'correct_digits']
-        # Scalars that need to be averaged
-        avg_keys = ['ntl_loss', 'ntl_reward', 'digit_accuracy']
-        
-        # Handle list concatenation
-        for key in list_keys:
-            if key in ntl_info_list[0]:
-                combined[key] = []
-                for info in ntl_info_list:
-                    if key in info and info[key] is not None:
-                        combined[key].extend(info[key])
-        
-        # Handle tensor concatenation
+        # Handle tensors that need to be concatenated along batch dimension
+        tensor_keys = ['digit_log_probs', 'digit_ground_truth_tensor']
         for key in tensor_keys:
             if key in ntl_info_list[0]:
-                tensors = [info[key] for info in ntl_info_list if key in info and info[key] is not None]
+                tensors = [info[key] for info in ntl_info_list 
+                          if key in info and info[key] is not None]
                 if tensors:
-                    combined[key] = torch.cat(tensors, dim=0)
+                    # Concatenate along batch dimension and convert to numpy
+                    concatenated_tensor = torch.cat(tensors, dim=0)
+                    # Convert to numpy for protocol compatibility
+                    if concatenated_tensor.dtype == torch.bfloat16:
+                        combined[key] = concatenated_tensor.float().cpu().numpy()
+                    else:
+                        combined[key] = concatenated_tensor.cpu().numpy()
         
-        # Handle sum aggregation
-        for key in sum_keys:
-            if key in ntl_info_list[0]:
-                combined[key] = sum(info.get(key, 0) for info in ntl_info_list)
-        
-        # Handle average aggregation
-        for key in avg_keys:
-            if key in ntl_info_list[0]:
-                values = [info.get(key, 0) for info in ntl_info_list if key in info]
-                combined[key] = sum(values) / len(values) if values else 0.0
-        
-        # Copy other keys from first batch
-        if ntl_info_list:
-            first_info = ntl_info_list[0]
-            for key, value in first_info.items():
-                if key not in combined:
-                    combined[key] = value
+        # Skip metadata copying - metadata fields were removed to simplify protocol handling
+        # metadata_keys = ['digit_token_map', 'has_digit_info', 'method']
+        # if ntl_info_list:
+        #     first_info = ntl_info_list[0]
+        #     for key in metadata_keys:
+        #         if key in first_info:
+        #             combined[key] = first_info[key]
+        pass  # No metadata to copy
         
         return combined
     
@@ -233,10 +220,107 @@ class DataParallelPPOActorNTL(DataParallelPPOActor):
                 original_metrics.update(ntl_metrics)
                 
         except Exception as e:
-            print(f"[NTL Actor] Warning: Failed to compute NTL metrics: {e}")
+            pass
         
         return original_metrics
     
     def get_last_ntl_info(self) -> Dict:
         """Get the NTL information from the last forward pass."""
         return getattr(self, '_last_ntl_info', {})
+    
+    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> DataProto:
+        """
+        Override the standard compute_log_prob to automatically extract NTL information.
+        
+        This ensures that when the trainer calls the standard compute_log_prob method,
+        we automatically extract and store NTL information if enabled.
+        
+        Returns:
+            DataProto with log_probs, entropys, and NTL info in meta_info
+        """
+        if self.ntl_enabled:
+            # Use the NTL-enabled method to get both log_probs and ntl_info
+            log_probs, entropys = super().compute_log_prob(data, calculate_entropy)
+            
+            # Now extract NTL info using the same approach as compute_log_prob_with_ntl
+            # but without duplicating the forward pass
+            ntl_info = {}
+            
+            if self.extract_digit_info:
+                # Validate tokenizer before proceeding
+                if self.tokenizer is None:
+                    raise ValueError("NTL extraction requires a tokenizer, but tokenizer is None. "
+                                   "Pass tokenizer during actor initialization.")
+                try:
+                    # We need to do another forward pass to get logits for NTL extraction
+                    # This is the price we pay for integrating with the existing interface
+                    micro_batches = self.split_data_into_micro_batch(data)
+                    all_ntl_info = []
+                    
+                    with torch.no_grad():
+                        for micro_batch in micro_batches:
+                            # Get logits for NTL extraction
+                            input_ids = micro_batch['input_ids']
+                            attention_mask = micro_batch['attention_mask']
+                            position_ids = micro_batch.get('position_ids', None)
+                            
+                            model_inputs = {
+                                'input_ids': input_ids,
+                                'attention_mask': attention_mask,
+                            }
+                            if position_ids is not None:
+                                model_inputs['position_ids'] = position_ids
+                            
+                            outputs = self.actor_module(**model_inputs)
+                            logits = outputs.logits
+                            
+                            # Extract response portion
+                            response_length = micro_batch["responses"].shape[1]
+                            response_logits = logits[:, -response_length - 1 : -1, :]
+                            response_ids = micro_batch["responses"]
+                            
+                            # Extract NTL information - now returns full digit logprobs tensor
+                            from ntl_local import prepare_digit_logprobs_for_reward
+                            ntl_reward_data = prepare_digit_logprobs_for_reward(
+                                logits=response_logits,
+                                input_ids=response_ids,
+                                tokenizer=self.tokenizer
+                            )
+                            all_ntl_info.append(ntl_reward_data)
+                    
+                    # Combine NTL info from all micro batches
+                    if all_ntl_info:
+                        ntl_info = self._combine_ntl_info(all_ntl_info)
+                        self._last_ntl_info = ntl_info  # Cache for get_last_ntl_info()
+                        
+                except ImportError as e:
+                    raise ImportError(f"Failed to import NTL utilities: {e}. "
+                                    "Ensure ntl_local module is available.") from e
+                except (KeyError, IndexError, ValueError) as e:
+                    raise RuntimeError(f"NTL extraction failed due to data format issue: {e}") from e
+                except Exception as e:
+                    # Log the error but don't crash training
+                    import logging
+                    logging.warning(f"NTL extraction failed: {e}")
+                    ntl_info = {'error': str(e)}
+            
+            # Create result DataProto matching the expected format
+            result = DataProto(batch={"log_probs": log_probs})
+            if calculate_entropy and entropys is not None:
+                result.batch["entropys"] = entropys
+            
+            # TEMPORARY: Completely disable NTL info in meta_info to isolate the issue
+            if ntl_info:
+                # Cache the full NTL info for potential future access
+                self._last_ntl_info = ntl_info
+                # DO NOT store ANYTHING in meta_info to avoid protocol concatenation issues
+                pass  # Explicitly do nothing with meta_info
+            
+            return result
+        else:
+            # Use the parent's standard method
+            log_probs, entropys = super().compute_log_prob(data, calculate_entropy)
+            result = DataProto(batch={"log_probs": log_probs})
+            if calculate_entropy and entropys is not None:
+                result.batch["entropys"] = entropys
+            return result

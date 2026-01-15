@@ -100,6 +100,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             - response_length/mean, max, min, clip_ratio: Statistics about response lengths
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
             - num_turns/mean, max, min: Statistics about the number of multi-turn conversations
+            - training/exact_match/mean, max, min: Statistics about exact match accuracy (if available)
+            - training/ntl_loss/mean, max, min, valid_ratio: Statistics about NTL loss (if available)
+            - training/ntl_reward/mean, max, min: Statistics about NTL rewards (if available)
     """
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
@@ -176,6 +179,29 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["num_turns/min"] = num_turns.min()
         metrics["num_turns/max"] = num_turns.max()
         metrics["num_turns/mean"] = num_turns.mean()
+    
+    # NTL metrics - add exact match and other reward function metrics if available
+    if "exact_match" in batch.non_tensor_batch:
+        exact_match = torch.from_numpy(batch.non_tensor_batch["exact_match"]).float()
+        metrics["training/exact_match/mean"] = torch.mean(exact_match).detach().item()
+        metrics["training/exact_match/max"] = torch.max(exact_match).detach().item()
+        metrics["training/exact_match/min"] = torch.min(exact_match).detach().item()
+    
+    if "ntl_loss" in batch.non_tensor_batch:
+        ntl_loss = torch.from_numpy(batch.non_tensor_batch["ntl_loss"]).float()
+        # Filter out -1.0 values (indicating no NTL info available)
+        valid_ntl_loss = ntl_loss[ntl_loss >= 0]
+        if len(valid_ntl_loss) > 0:
+            metrics["training/ntl_loss/mean"] = torch.mean(valid_ntl_loss).detach().item()
+            metrics["training/ntl_loss/max"] = torch.max(valid_ntl_loss).detach().item()
+            metrics["training/ntl_loss/min"] = torch.min(valid_ntl_loss).detach().item()
+            metrics["training/ntl_loss/valid_ratio"] = (len(valid_ntl_loss) / len(ntl_loss))
+    
+    if "ntl_reward" in batch.non_tensor_batch:
+        ntl_reward = torch.from_numpy(batch.non_tensor_batch["ntl_reward"]).float()
+        metrics["training/ntl_reward/mean"] = torch.mean(ntl_reward).detach().item()
+        metrics["training/ntl_reward/max"] = torch.max(ntl_reward).detach().item()
+        metrics["training/ntl_reward/min"] = torch.min(ntl_reward).detach().item()
 
     return metrics
 

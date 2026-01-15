@@ -563,6 +563,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         from verl.workers.actor import DataParallelPPOActor
+        
+        # Try to import NTL actor, but continue without it if not available
+        FSDPPPOActorNTL = None
+        try:
+            from verl.workers.actor.fsdp_actor_ntl import FSDPPPOActorNTL
+        except ImportError as e:
+            if self.rank == 0:
+                print(f"Warning: NTL actor not available: {e}. Using standard actor.")
 
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
@@ -615,9 +623,37 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
-            self.actor = DataParallelPPOActor(
-                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
-            )
+            # Check if NTL is enabled in the config and NTL actor is available
+            use_ntl = getattr(self.config.actor, 'use_ntl', False) or getattr(self.config.model, 'use_ntl', False)
+            
+            if use_ntl and FSDPPPOActorNTL is not None:
+                if self.rank == 0:
+                    print("Initializing NTL-enhanced actor")
+                try:
+                    self.actor = FSDPPPOActorNTL(
+                        config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer,
+                        tokenizer=self.tokenizer
+                    )
+                    if self.rank == 0:
+                        print(f"SUCCESS: NTL actor initialized - type: {type(self.actor).__name__}")
+                except Exception as e:
+                    if self.rank == 0:
+                        print(f"FAILED to initialize NTL actor: {e}. Falling back to standard actor.")
+                    self.actor = DataParallelPPOActor(
+                        config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+                    )
+                    if self.rank == 0:
+                        print(f"FALLBACK: Standard actor initialized - type: {type(self.actor).__name__}")
+            else:
+                if use_ntl and self.rank == 0:
+                    print(f"NTL requested but not available. use_ntl={use_ntl}, FSDPPPOActorNTL={FSDPPPOActorNTL is not None}")
+                if self.rank == 0:
+                    print("Using standard DataParallelPPOActor")
+                self.actor = DataParallelPPOActor(
+                    config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+                )
+                if self.rank == 0:
+                    print(f"STANDARD: Actor initialized - type: {type(self.actor).__name__}")
 
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout(
@@ -777,8 +813,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             data = self.ulysses_sharding_manager.preprocess_data(data)
             with adapter_ctx:
                 output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            
+            # Handle NTL tensor extraction if using NTL actor
+            tensor_dict = {"old_log_probs": output, "entropys": entropys}
+            try:
+                # Only attempt NTL extraction if actor has NTL capabilities
+                if hasattr(self.actor, 'get_last_ntl_info'):
+                    ntl_info = self.actor.get_last_ntl_info()
+                    if ntl_info and isinstance(ntl_info, dict):
+                        if 'digit_log_probs' in ntl_info and ntl_info['digit_log_probs'] is not None:
+                            # Store NTL tensors in tensor batch for protocol consistency
+                            tensor_dict['ntl_digit_log_probs'] = ntl_info['digit_log_probs']
+                        if 'digit_ground_truth_tensor' in ntl_info and ntl_info['digit_ground_truth_tensor'] is not None:
+                            tensor_dict['ntl_digit_ground_truth_tensor'] = ntl_info['digit_ground_truth_tensor']
+            except Exception as e:
+                # If NTL extraction fails, continue without it to not break the main pipeline
+                if self.rank == 0:
+                    print(f"Warning: NTL tensor extraction failed: {e}")
+            
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
+                tensors=tensor_dict,
                 meta_info={"temperature": self.config.rollout.temperature},
             )
             output = self.ulysses_sharding_manager.postprocess_data(output)
